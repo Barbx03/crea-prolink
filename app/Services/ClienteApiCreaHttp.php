@@ -26,10 +26,12 @@ final class ClienteApiCreaHttp implements ClienteApiCrea
      * O marcador entre chaves e substituido pelo parametro da consulta.
      */
     private const ROTAS_PADRAO = [
-        'PROFISSIONAL' => '/profissionais/{cpf}',
-        'EMPRESA'      => '/empresas/{cnpj}',
-        'ART'          => '/profissionais/{rnp}/arts',
-        'CAT'          => '/profissionais/{rnp}/cats',
+        'PROFISSIONAL' => '?p=profissionais',
+        'EMPRESA'      => '?p=empresas',
+        'ART'          => '?p=profissionais/{rnp}/arts',
+        'ART_NUMERO'   => '?p=arts',
+        'CAT'          => '?p=profissionais/{rnp}/cats',
+        'CAT_NUMERO'   => '?p=cats',
     ];
 
     public function __construct(
@@ -47,7 +49,7 @@ final class ClienteApiCreaHttp implements ClienteApiCrea
     /** @return array{dados: array<string, mixed>, bruto: string} */
     public function profissionalPorCpf(string $cpf): array
     {
-        $resposta = $this->consultar('PROFISSIONAL', ['cpf' => $cpf], ['cpf' => $cpf]);
+        $resposta = $this->consultar('PROFISSIONAL', [], ['cpf' => $cpf]);
 
         return [
             'dados' => NormalizadorApiCrea::profissional($resposta['corpo']),
@@ -58,7 +60,7 @@ final class ClienteApiCreaHttp implements ClienteApiCrea
     /** @return array{dados: array<string, mixed>, bruto: string} */
     public function empresaPorCnpj(string $cnpj): array
     {
-        $resposta = $this->consultar('EMPRESA', ['cnpj' => $cnpj], ['cnpj' => $cnpj]);
+        $resposta = $this->consultar('EMPRESA', [], ['cnpj' => $cnpj]);
 
         return [
             'dados' => NormalizadorApiCrea::empresa($resposta['corpo']),
@@ -69,8 +71,12 @@ final class ClienteApiCreaHttp implements ClienteApiCrea
     /** @return array{dados: list<array<string, mixed>>, bruto: string} */
     public function artsPorRnp(string $rnp, ?string $numeroArt = null): array
     {
-        $consulta = $numeroArt !== null && $numeroArt !== '' ? ['numero' => $numeroArt] : [];
-        $resposta = $this->consultar('ART', ['rnp' => $rnp], $consulta);
+        // Informado o número, usa-se o endpoint de validação de veracidade da
+        // ART, que casa RNP e número — é exatamente a conferência pedida no
+        // RF03. Sem número, lista-se o acervo do RNP de forma paginada.
+        $resposta = $numeroArt !== null && $numeroArt !== ''
+            ? $this->consultar('ART_NUMERO', [], ['rnp' => $rnp, 'art_numero' => $numeroArt])
+            : $this->consultar('ART', ['rnp' => $rnp], ['limit' => '100']);
 
         return [
             'dados' => NormalizadorApiCrea::arts($resposta['corpo'], $rnp, $numeroArt),
@@ -81,8 +87,9 @@ final class ClienteApiCreaHttp implements ClienteApiCrea
     /** @return array{dados: list<array<string, mixed>>, bruto: string} */
     public function catsPorRnp(string $rnp, ?string $numeroCat = null): array
     {
-        $consulta = $numeroCat !== null && $numeroCat !== '' ? ['numero' => $numeroCat] : [];
-        $resposta = $this->consultar('CAT', ['rnp' => $rnp], $consulta);
+        $resposta = $numeroCat !== null && $numeroCat !== ''
+            ? $this->consultar('CAT_NUMERO', [], ['rnp' => $rnp, 'cat_numero' => $numeroCat])
+            : $this->consultar('CAT', ['rnp' => $rnp], ['limit' => '100']);
 
         return [
             'dados' => NormalizadorApiCrea::cats($resposta['corpo'], $rnp, $numeroCat),
@@ -125,7 +132,10 @@ final class ClienteApiCreaHttp implements ClienteApiCrea
         $corpoBruto = curl_exec($curl);
         $httpStatus = (int) curl_getinfo($curl, CURLINFO_RESPONSE_CODE);
         $erroCurl   = curl_error($curl);
-        curl_close($curl);
+
+        // curl_close() deixou de ter efeito no PHP 8.0: o recurso e liberado
+        // quando a variavel sai de escopo.
+        unset($curl);
 
         $duracao = (int) round((microtime(true) - $inicio) * 1000);
 
@@ -179,6 +189,19 @@ final class ClienteApiCreaHttp implements ClienteApiCrea
             );
         }
 
+        // A API sinaliza erro de negócio com HTTP 200 e a chave "error"
+        if (isset($corpo['error'])) {
+            $mensagem = (string) $corpo['error'];
+            $this->registrarConsulta($recurso, $substituicoes, $endpoint, $httpStatus, false, $duracao, $mensagem);
+
+            throw new ExcecaoApiCrea(
+                'A API oficial recusou a consulta: ' . $mensagem,
+                $httpStatus,
+                $recurso,
+                str_contains(mb_strtolower($mensagem), 'encontrad')
+            );
+        }
+
         $this->registrarConsulta($recurso, $substituicoes, $endpoint, $httpStatus, true, $duracao, 'Consulta realizada');
 
         return ['corpo' => $corpo, 'bruto' => $corpoBruto, 'http' => $httpStatus];
@@ -203,7 +226,10 @@ final class ClienteApiCreaHttp implements ClienteApiCrea
         $endpoint = $this->url() . '/' . ltrim($rota, '/');
 
         if ($parametrosConsulta !== []) {
-            $endpoint .= (str_contains($endpoint, '?') ? '&' : '?') . http_build_query($parametrosConsulta);
+            // A rota da API oficial já começa com "?p=", então a junção precisa
+            // usar "&"; a verificação cobre os dois formatos.
+            $separador = str_contains($endpoint, '?') ? '&' : '?';
+            $endpoint .= $separador . http_build_query($parametrosConsulta);
         }
 
         return $endpoint;
